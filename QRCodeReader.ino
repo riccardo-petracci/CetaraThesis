@@ -188,11 +188,13 @@ void serialScanerEvent() {
       digitalWrite(LED_BUILTIN, LOW);
     }
     writeRecord();
+    readAndSendRecord();
   }
 }
 
 void readAndSendRecord() {    //check exist file name, if no record.txt i
   if (SD.exists(FILE_NAME)) { //don't run this method
+    record_file = SD.open(FILE_NAME, FILE_WRITE);
     char *buffer;
     boolean connected = false;
     int byteRead = 0, statusCode, numberSend = 0;
@@ -216,10 +218,10 @@ void readAndSendRecord() {    //check exist file name, if no record.txt i
           String dataToGet = fscanf(record_file);
           client.println("GET " + path + "?" + dataToGet);
           int maxDelay = 10; // sec
-          log(dataToGet);
+          Serial.println(dataToGet);
         }
         record_file.close();
-        //SD.remove(FILE_NAME);
+        SD.remove(FILE_NAME);
         log("Remove buffer");
         printOLED("Record sent and buffer removed", 0, 0);
       } else {
@@ -228,13 +230,13 @@ void readAndSendRecord() {    //check exist file name, if no record.txt i
       client.stop();
       record_file.close();
     }
-    //gsmAccess.lowPowerMode();
+    gsmAccess.lowPowerMode();
     Serial.println("gsm low power mode");
-    delay(10000);
   } else {
     gsmAccess.shutdown();
     Serial.println("record.txt does not exist, gsm shotdown");
   }
+  delay(1000*60*10);
 }
 
 void setup() {
@@ -266,7 +268,7 @@ void setup() {
   LowPower.attachInterruptWakeup(PIN_POWER, Wakeup_Sleep, FALLING);
   printOLED("Ready", 0, 0);
   if (!SD.begin()) {
-    printOLED("FS Error", 0, 0); log("FS error");
+    printOLED("SD Error", 0, 0); log("SD error");
   }
   log("End init");
   Scheduler.startLoop(gps);
