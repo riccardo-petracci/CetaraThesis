@@ -1,14 +1,3 @@
-/*
-BarCode and QRCode Reader project to send to a server data with
-GPS information. Low Power Manager allow to consume less power
-to not drain battery in a short time. The dispositive need 3.3V
-to work except for the barcode reader that need 5V in input to
-work. All data are writed also in a SD memory waiting segnal to
-send them to the server. When data are sent the SD file that store
-data is cancelled.
-*/
-
-
 #include <AceRoutine.h>
 #include <Arduino.h>
 using namespace ace_routine;
@@ -73,9 +62,9 @@ String method = "GET";
 String path = "/qrcode/index.php?";
 int port = 80; // port 80 is the default for HTTP
 
-static const unsigned long batteryDelay = 1000 * 60 * 20;
-static const unsigned long gpsDelay = 1000 * 60 * 10;
-static const unsigned long readDelay = 1000 * 60 * 10;
+static const unsigned long batteryDelay = 60;
+static const unsigned long gpsDelay = 1800;
+static const unsigned long readDelay = 300;
 
 volatile int p;
 volatile boolean rtcSleep = false;
@@ -131,8 +120,7 @@ COROUTINE(gps) {  // reading gps value
     printOLED("GPS updated",0,0);
     log("End GPS");
     GPS.standby();
-    COROUTINE_DELAY(gpsDelay);
-    //COROUTINE_END();
+    COROUTINE_DELAY_SECONDS(gpsDelay);
   }
 }
 
@@ -152,14 +140,13 @@ COROUTINE(battery) { // value of battery
     sprintf(result, "Battery %f", batteryLevel);
     log(result);
     printOLED(result, 0, 0);
-    COROUTINE_DELAY(batteryDelay);
-    //COROUTINE_DELAY(1000*60);
+    COROUTINE_DELAY_SECONDS(batteryDelay);
   }
 }
 
 void writeRecord() {
   record_file = SD.open(FILE_NAME, FILE_WRITE);
-  const int wait = 2;
+  const int wait = 5;
   String str;
   str += "device=" + uid + "&";
   str += "unixtime=" + String(lastGPS.time) + "&";
@@ -181,6 +168,7 @@ void writeRecord() {
 
 COROUTINE(serialScanerEvent) { //Read QRCodes
   COROUTINE_LOOP() {
+    //if(5volt in == true){
     while (Serial1.available() > 0) {
       char inChar = (char)Serial1.read();
       QRCode += inChar;
@@ -199,7 +187,8 @@ COROUTINE(serialScanerEvent) { //Read QRCodes
       }
       writeRecord();
     }
-    //COROUTINE_END();
+  //}
+    COROUTINE_DELAY_SECONDS(2);
   }
 }
 
@@ -245,18 +234,19 @@ COROUTINE(readAndSendRecord) {  //check exist file name, if no record.txt i
               // read an incoming byte from the server and print it to serial monitor:
               char c = client.read();
               Serial.print(c);
+              String one = String(c);
+              boolean ok = one.indexOf('200');
+              if(ok){printOLED("HTTP request ack 200",0,0);}
             }
           }
 
           while (record_file.available()) {
-            delay(200);
             record_file.close();
-            delay(200);
+            delay(500);
           }
           while (SD.exists(FILE_NAME)) {
-            delay(200);
             SD.remove(FILE_NAME);
-            delay(200);
+            delay(500);
           }
           log("Remove buffer");
           printOLED("Record sent and buffer removed", 0, 0);
@@ -272,8 +262,7 @@ COROUTINE(readAndSendRecord) {  //check exist file name, if no record.txt i
       gsmAccess.shutdown();
       Serial.println("record.txt does not exist, gsm shutdown");
     }
-    COROUTINE_DELAY(readDelay);
-    //COROUTINE_END();
+    COROUTINE_DELAY_SECONDS(readDelay);
   }
 }
 
@@ -284,16 +273,19 @@ COROUTINE(LowEnergyManager) {
       rtcSleep = true;
       }else{rtcSleep=false;}
     if(rtcSleep == true && GPSUpdated == true){  
-    //if(rtcSleep == true){
       if(SD.exists(FILE_NAME)){
         printOLED("Sleep\nPress button to\nresume",0,0);
-        LowPower.sleep(1000*60*10);
+        LowPower.sleep(readDelay*1000);
+        rtcSleep = false;
+        lastActivity = rtc.getMinutes()+2;
         }else{          
           printOLED("DeepSleep\nPress button to\nresume",0,0);
-          LowPower.deepSleep(1000*60*30);
+          LowPower.deepSleep(gpsDelay*1000);
+          rtcSleep = false;
+          lastActivity = rtc.getMinutes()+2;
           }
       }
-    COROUTINE_DELAY(20000);
+    COROUTINE_DELAY_SECONDS(5);
   }
 }
    
@@ -301,7 +293,7 @@ void setup() {
   Serial.begin(9600);  log("Serial ready");
   Serial1.begin(9600); log("Scanner ready");
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  if (!GPS.begin()) { //param GPS_MODE_SHIELD if the shield is used instead of I2C
+  if (!GPS.begin()) {
     Serial.println("Failed to initialize GPS!");
     while (1);
   }
