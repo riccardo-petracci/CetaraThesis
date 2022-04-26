@@ -173,7 +173,8 @@ void writeRecord() {
 COROUTINE(serialScanerEvent) { //Read QRCodes
   COROUTINE_LOOP() {
     diValue = analogRead(dividerPin);
-    if(diValue >= 2.5){
+    float voltage = diValue * (5.0 / 1023.0);
+    if(voltage > 3.0){
       while (Serial1.available() > 0) {
         char inChar = (char)Serial1.read();
         QRCode += inChar;
