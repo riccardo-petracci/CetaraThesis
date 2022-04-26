@@ -1,5 +1,7 @@
-#include <Scheduler.h>        // Cooperative task scheduler
-#include <UrlEncode.h>        // Encode for GET request
+#include <AceRoutine.h>
+#include <Arduino.h>
+using namespace ace_routine;
+
 #include <ArduinoUniqueID.h>  // Device ID
 #include <SPI.h>              // protocol to SD
 #include <SD.h>               // Labrary fo SD
@@ -8,29 +10,26 @@
 #include <Arduino_MKRGPS.h>   // GPS
 #include <MKRGSM.h>           // GSM
 #include <time.h>             // GPS to Time
-//#include <Arduino_MKRMEM.h>   // Flash
+//#include <Arduino_MKRMEM.h> // Flash
 #include <Wire.h>             // I2C
 #include <Adafruit_GFX.h>     // Display
 #include <Adafruit_SSD1306.h> // Display
 #include <wiring_private.h>   // Second serial
 #include "ArduinoLowPower.h"  // LowEnergy
+#include <MD5.h>              //MD5 hash algorithm
 
 #define DEBUG                 true // false <<<=============
-#define MAX_DELAY_CONNECTION 5000 // connection
-#define SSD1306_128_64        // OLED display model
-#define SCREEN_WIDTH 128      // OLED display width, in pixels
-#define SCREEN_HEIGHT 64      // OLED display height, in pixels
-#define DIM_QRCODE 100        // number of byte of QR code
-#define PIN_POWER  4          // pin 4 for power button
-#define PIN_ACTIVITY 7        // led for activity
-#define SIZE_RECORD 256       // size of record in flash
-#define PORT 443               // port 443https 80 http
-#define FILE_NAME "record.txt"// file name record in flash
-#define FILE_LOG  "log.txt"   // file with success and errors
-//#define SERVER    "4helix.unicam.it"
-//#define PATH "/cetara.php?"
-//#define PINNUMBER "1234"
-#define GPRS_APN "web.ho-mobile.it"
+#define MAX_DELAY_CONNECTION 5000  // connection
+#define SSD1306_128_64             // OLED display model
+#define SCREEN_WIDTH 128           // OLED display width, in pixels
+#define SCREEN_HEIGHT 64           // OLED display height, in pixels
+#define DIM_QRCODE 100             // number of byte of QR code
+#define PIN_POWER  0               // pin 4 for power button
+#define PIN_ACTIVITY 7             // led for activity
+#define SIZE_RECORD 256            // size of record in flash
+#define FILE_NAME "record.txt"     // file name record in flash
+#define FILE_LOG  "log.txt"        // file with success and errors
+#define GPRS_APN ""
 #define GPRS_LOGIN ""
 #define GPRS_PASSWORD ""
 /* BEGIN COMMON ---------------------- */
@@ -51,16 +50,31 @@ float batteryLevel;               // last voltage of battey
 String QRCode;                    // Buffer for QRCode
 String QRCode_old;                // Last QRCode
 Adafruit_SSD1306 display(4);      // Oled reset
-boolean stringComplete = false;  //--
-int countstr = 0;                // For Scanner
-unsigned long millisendstr = 0;  //--
+boolean stringComplete = false;   //--
+int countstr = 0;                 // For Scanner
+unsigned long millisendstr = 0;   //--
 String uid;
 GSMClient client;
 GSM  gsmAccess;
 GPRS gprs;
-char server[] = "vps-c0d4c583.vps.ovh.net";
-String path = "/qrcode/index.php";
+char server[] = "YOUR SERVER IP";
+String method = "GET"; //or POST
+String path = "YOUR PATH";
 int port = 80; // port 80 is the default for HTTP
+String key = "SECRET KEY STRING";
+
+int dividerPin = A1;    //pin for the divider
+int diValue = 0;        // variable to store the value coming from the divider
+
+static const unsigned long batteryDelay = 60;  //delay coroutine battery in seconds
+static const unsigned long gpsDelay = 60;      //delay coroutine gps in seconds
+static const unsigned long readDelay = 60;     //delay coroutine reading and sending in seconds
+
+volatile int p;                         //variable for the lowpower
+volatile boolean rtcSleep = false;      //varible used to manage the sleep
+volatile boolean GPSUpdated = false;    //variable used to trace GPS update
+
+volatile int lastActivity = 0;          //inactivity variable
 
 /* END COMMON ---------------------- */
 
@@ -88,28 +102,30 @@ void log(String info) {
   }
 }
 
-void gps() {  // reading gps value
-  const long gpsDelay = 300000;
-  log("WakeUp GPS");
-  GPS.wakeup();
-  while (!GPS.available()) {
-    //Serial.println("gps not available, yield()");
-    delay(1000);
-    yield();
+COROUTINE(gps) {  // reading gps value
+  COROUTINE_LOOP() {
+    GPSUpdated = false;
+    log("WakeUp GPS");
+    GPS.wakeup();
+    while (!GPS.available()) {
+      COROUTINE_YIELD();
+    }
+    log("Init GPS");
+    time_t epochTime = GPS.getTime();
+    struct tm now = *localtime(&epochTime);
+    rtc.setDate(now.tm_mday, now.tm_mon + 1, now.tm_year);
+    rtc.setTime(now.tm_hour, now.tm_min, now.tm_sec);
+    lastGPS.time       = GPS.getTime();
+    lastGPS.latitude   = GPS.latitude();
+    lastGPS.longitude  = GPS.longitude();
+    lastGPS.altitude   = GPS.altitude();
+    lastGPS.satellites = GPS.satellites();
+    GPSUpdated = true;
+    printOLED("GPS updated", 0, 0);
+    log("End GPS");
+    GPS.standby();
+    COROUTINE_DELAY_SECONDS(gpsDelay);
   }
-  log("Init GPS");
-  time_t epochTime = GPS.getTime();
-  struct tm now = *localtime(&epochTime);
-  rtc.setDate(now.tm_mday, now.tm_mon + 1, now.tm_year);
-  rtc.setTime(now.tm_hour, now.tm_min, now.tm_sec);
-  lastGPS.time       = GPS.getTime();
-  lastGPS.latitude   = GPS.latitude();
-  lastGPS.longitude  = GPS.longitude();
-  lastGPS.altitude   = GPS.altitude();
-  lastGPS.satellites = GPS.satellites();
-  log("End GPS");
-  GPS.standby();
-  delay(gpsDelay);
 }
 
 void printOLED(char *t, int r, int c) { // write display message
@@ -121,37 +137,20 @@ void printOLED(char *t, int r, int c) { // write display message
   display.display(); //Invia il buffer da visualizzare al display
 }
 
-void battery() { // value of battery
-  const int batteryDelay = 300000;
-  batteryLevel = analogRead(ADC_BATTERY) * 3.3f / 1023.0f / 1.2f * (1.2f + 0.33f);
-  char result[20];
-  sprintf(result, "Battery %f", batteryLevel);
-  log(result);
-  printOLED(result, 0, 0);
-  //yield();
-  delay(batteryDelay);
-}
-
-void enableSleep() {
-  log("DeepSleep");
-  printOLED("deep sleep", 0, 0);
-  LowPower.deepSleep();
-}
-
-void setDelayRTC() {
-  const int wait = 30;
-  rtc.setAlarmTime(rtc.getHours(), (rtc.getMinutes() + wait) % 60, 0);
-  rtc.enableAlarm(rtc.MATCH_MMSS);
-  log("Enable Sleep Timeout");
-}
-
-void Wakeup_Sleep() {
-  //printOLED("Wake up", 0, 0);
-  log("WakeUp_Sleep");
+COROUTINE(battery) { // value of battery
+  COROUTINE_LOOP() {
+    batteryLevel = analogRead(ADC_BATTERY) * 3.3f / 1023.0f / 1.2f * (1.2f + 0.33f);
+    char result[20];
+    sprintf(result, "Battery %f", batteryLevel);
+    log(result);
+    printOLED(result, 0, 0);
+    COROUTINE_DELAY_SECONDS(batteryDelay);
+  }
 }
 
 void writeRecord() {
   record_file = SD.open(FILE_NAME, FILE_WRITE);
+  const int wait = 5;
   String str;
   str += "device=" + uid + "&";
   str += "unixtime=" + String(lastGPS.time) + "&";
@@ -168,82 +167,153 @@ void writeRecord() {
   record_file.close();
   log(str);
   printOLED("Record Writed", 0, 0);
-  setDelayRTC();
+  lastActivity = rtc.getMinutes() + wait;
 }
 
-void serialScanerEvent() {
-  while (Serial1.available() > 0) {
-    char inChar = (char)Serial1.read();
-    QRCode += inChar;
-    countstr++;
-    millisendstr = millis();
-  }
-  yield();
-  if (millis() - millisendstr > 1000 && countstr > 0) {
-    stringComplete = true;
-    if (QRCode != QRCode_old) { // anti aliasing
-      QRCode_old = QRCode;
-      digitalWrite(LED_BUILTIN, HIGH);
-      delay(500);
-      digitalWrite(LED_BUILTIN, LOW);
-    }
-    writeRecord();
-    readAndSendRecord();
-  }
-}
-
-void readAndSendRecord() {    //check exist file name, if no record.txt i
-  if (SD.exists(FILE_NAME)) { //don't run this method
-    record_file = SD.open(FILE_NAME, FILE_WRITE);
-    char *buffer;
-    boolean connected = false;
-    int byteRead = 0, statusCode, numberSend = 0;
-    Serial.println("Connecting...");
-    if ((gsmAccess.begin() == GSM_READY) &&
-        (gprs.attachGPRS(GPRS_APN, GPRS_LOGIN, GPRS_PASSWORD) == GPRS_READY)) {
-      log("GPRS attach");
-      unsigned long timeout = millis() + MAX_DELAY_CONNECTION;
-      while (millis() < timeout) {
-        if (client.connect(server, port)) {
-          log("connected");
-          connected = true;
-          break;
-        }
-        yield();
+COROUTINE(serialScanerEvent) { //Read QRCodes
+  COROUTINE_LOOP() {
+    diValue = analogRead(dividerPin);
+    if(diValue >= 2.5){
+      while (Serial1.available() > 0) {
+        char inChar = (char)Serial1.read();
+        QRCode += inChar;
+        countstr++;
+       millisendstr = millis();
       }
-      if (connected) {
+     COROUTINE_YIELD();
+      if (millis() - millisendstr > 1000 && countstr > 0) {
+       stringComplete = true;
+        if (QRCode != QRCode_old) { // anti aliasing
+          QRCode_old = QRCode;
+          printOLED("QRCode acquired", 0, 0);
+          digitalWrite(LED_BUILTIN, HIGH);
+          delay(500);
+          digitalWrite(LED_BUILTIN, LOW);
+       }
+        writeRecord();
+     }
+    }
+    COROUTINE_DELAY_SECONDS(2);
+  }
+}
+
+COROUTINE(readAndSendRecord) {
+  COROUTINE_LOOP() {
+    if (SD.exists(FILE_NAME)) {
+      char *buffer;
+      boolean connected = false;
+      int byteRead = 0, statusCode, numberSend = 0;
+      Serial.println("Connecting...");
+      printOLED("Connecting GSM,\nscanner not\navailable", 0, 0);
+      if ((gsmAccess.begin() == GSM_READY) &&
+          (gprs.attachGPRS(GPRS_APN, GPRS_LOGIN, GPRS_PASSWORD) == GPRS_READY)) {
+        log("GPRS attach");
+        record_file = SD.open(FILE_NAME, FILE_READ);
         record_file.seek(0);
-        Serial.println("Seek position 0");
-        while (record_file.available()) {
-          String dataToGet = fscanf(record_file);
-          client.println("GET " + path + "?" + dataToGet);
-          int maxDelay = 10; // sec
-          Serial.println(dataToGet);
+        boolean finish = false;
+        while (!finish) {
+          unsigned long timeout = millis() + MAX_DELAY_CONNECTION;
+          while (millis() < timeout) {
+            if (client.connect(server, port)) {
+              log("connected");
+              printOLED("Connected", 0, 0);
+              connected = true;
+              break;
+            }
+            COROUTINE_YIELD();
+          }
+          if (connected) {
+            printOLED("Sending data\nto server . . .", 0, 0);
+            String dataToGet = fscanf(record_file);
+            if (dataToGet == "") {
+              finish = true;
+              while (record_file.available()) {
+                record_file.close();
+                delay(500);
+              }
+              while (SD.exists(FILE_NAME)) {
+                SD.remove(FILE_NAME);
+                delay(500);
+              }
+              log("Remove buffer");
+              printOLED("Record sent and buffer removed", 0, 0);
+              break;
+            }
+            delay(500);
+            String secret = dataToGet + key;
+            Serial.println(secret);
+            char charBuf[250];
+            secret.toCharArray(charBuf, 250);
+            unsigned char* hash = MD5::make_hash(charBuf);
+            char *md5str = MD5::make_digest(hash, 16);
+            free(hash);
+            // send HTTP request header
+            client.println(method + " " + path + dataToGet + "&z=" + md5str + " HTTP/1.1");
+            client.println("Host: " + String(server));
+            client.println("Connection: close");
+            client.println(); // end HTTP request header
+            Serial.println(dataToGet);
+            Serial.println(md5str);
+            free(md5str);
+
+            while (client.connected()) {
+              if (client.available()) {
+                // read an incoming byte from the server and print it to serial monitor:
+                char c = client.read();
+                Serial.print(c);
+                String one = String(c);
+                if (one.indexOf("200") != -1) {
+                  printOLED("HTTP request ack 200", 0, 0);
+                }
+              }
+            }
+          } else {
+            log("Connection timeout");
+          }
+          client.stop();
+          delay(1000);
         }
-        record_file.close();
-        SD.remove(FILE_NAME);
-        log("Remove buffer");
-        printOLED("Record sent and buffer removed", 0, 0);
-      } else {
-        log("Connection timeout");
       }
-      client.stop();
-      record_file.close();
+      gsmAccess.lowPowerMode();
+      Serial.println("gsm low power mode");
+    } else {
+      gsmAccess.shutdown();
+      Serial.println("record.txt does not exist, gsm shutdown");
     }
-    gsmAccess.lowPowerMode();
-    Serial.println("gsm low power mode");
-  } else {
-    gsmAccess.shutdown();
-    Serial.println("record.txt does not exist, gsm shotdown");
+    COROUTINE_DELAY_SECONDS(readDelay);
   }
-  delay(1000*60*10);
+}
+
+COROUTINE(LowEnergyManager) {
+  COROUTINE_LOOP() {
+    //inactivity time passed
+    if (rtc.getMinutes() >= lastActivity) {
+      rtcSleep = true;
+    } else {
+      rtcSleep = false;
+    }
+    if (rtcSleep == true && GPSUpdated == true) {
+      if (SD.exists(FILE_NAME)) {
+        printOLED("Sleep\nPress button to\nresume", 0, 0);
+        LowPower.sleep(readDelay * 1000);
+        rtcSleep = false;
+        lastActivity = rtc.getMinutes() + 2;
+      } else {
+        printOLED("DeepSleep\nPress button to\nresume", 0, 0);
+        LowPower.deepSleep(gpsDelay * 1000);
+        rtcSleep = false;
+        lastActivity = rtc.getMinutes() + 2;
+      }
+    }
+    COROUTINE_DELAY_SECONDS(5);
+  }
 }
 
 void setup() {
   Serial.begin(9600); while (!Serial); log("Serial ready");
-  Serial1.begin(9600); while (!Serial); log("Scanner ready");
+  Serial1.begin(9600); log("Scanner ready");
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  if (!GPS.begin()) { //param GPS_MODE_SHIELD if the shield is used instead of I2C
+  if (!GPS.begin()) {
     Serial.println("Failed to initialize GPS!");
     while (1);
   }
@@ -256,28 +326,37 @@ void setup() {
   }
   uid.toUpperCase();
   log("UniqueID: " + uid);
-
+  pinMode(PIN_POWER, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);     // attach Led power
-  pinMode(PIN_POWER, INPUT_PULLUP); // attach button on pin
   analogReference(AR_DEFAULT);
   rtc.begin(); // real time clock
-  rtc.attachInterrupt(enableSleep); // attach timer for sleep
   QRCode.reserve(DIM_QRCODE);
   QRCode_old.reserve(DIM_QRCODE);
   QRCode_old = "$$$$$$$$$$$$$";
-  LowPower.attachInterruptWakeup(PIN_POWER, Wakeup_Sleep, FALLING);
   printOLED("Ready", 0, 0);
-  if (!SD.begin()) {
+  log("End init");
+  if (!SD.begin(4)) {
     printOLED("SD Error", 0, 0); log("SD error");
   }
-  log("End init");
-  Scheduler.startLoop(gps);
-  delay(1000);
-  Scheduler.startLoop(serialScanerEvent);
-  Scheduler.startLoop(readAndSendRecord);
-  //Scheduler.startLoop(battery);
+  LowPower.attachInterruptWakeup(PIN_POWER, Wakeup_Sleep, FALLING);
 }
 
 void loop() {
-  battery();
+  for (int i = 0; i < p; i++) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(100);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(100);
+  }
+  gps.runCoroutine();
+  battery.runCoroutine();
+  serialScanerEvent.runCoroutine();
+  readAndSendRecord.runCoroutine();
+  LowEnergyManager.runCoroutine();
+}
+
+void Wakeup_Sleep() {
+  printOLED("Wake up", 0, 0);
+  Serial.println("wake up");
+  p = 1;
 }
