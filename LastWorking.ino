@@ -113,7 +113,7 @@ COROUTINE(gps) {  // reading gps value
     forceStop = rtc.getMinutes() + 7;
     while (!GPS.available()) {
       COROUTINE_YIELD();
-      if (rtc.getMinutes() >= forceStop) {
+      if (rtc.getMinutes() >= (forceStop%60)) {
         GPSUpdated = true;
         printOLED("GPS not updated, force stop", 0, 0);
         break;
@@ -308,7 +308,7 @@ COROUTINE(readAndSendRecord) {
 COROUTINE(LowEnergyManager) {
   COROUTINE_LOOP() {
     //inactivity time passed
-    if (rtc.getMinutes() >= lastActivity) {
+    if (rtc.getMinutes() >= (lastActivity%60)) {
       rtcSleep = true;
     }
     if (rtcSleep == true && GPSUpdated == true) {
