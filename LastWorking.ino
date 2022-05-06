@@ -76,7 +76,8 @@ volatile int p;                         //variable for the lowpower
 volatile boolean rtcSleep = false;      //varible used to manage the sleep
 volatile boolean GPSUpdated = false;    //variable used to trace GPS update
 
-volatile int lastActivity = 0;          //inactivity variable
+volatile int lastActivity = 0;        //inactivity variable
+volatile int forceStop = 0;             //Forcing GPS
 
 /* END COMMON ---------------------- */
 
@@ -109,7 +110,7 @@ COROUTINE(gps) {  // reading gps value
     GPSUpdated = false;
     log("WakeUp GPS");
     GPS.wakeup();
-    int forceStop = rtc.getMinutes()+7;
+    forceStop = rtc.getMinutes() + 7;
     while (!GPS.available()) {
       COROUTINE_YIELD();
       if (rtc.getMinutes() >= forceStop) {
@@ -150,14 +151,21 @@ void printOLED(char *t, int r, int c) { // write display message
 
 COROUTINE(battery) { // value of battery
   COROUTINE_LOOP() {
-    batteryLevel = analogRead(ADC_BATTERY) * 3.3f / 1023.0f / 1.2f * (1.2f + 0.33f);
-    char result[20];
-    sprintf(result, "Battery %f", batteryLevel);
-    log(result);
-    printOLED(result, 0, 0);
+    diValue = analogRead(dividerPin);
+    float voltage = diValue * (5.0 / 1023.0);
+    if (voltage < 3.0) {
+      batteryLevel = analogRead(ADC_BATTERY) * 3.3f / 1023.0f / 1.2f * (1.2f + 0.33f);
+      char result[20];
+      sprintf(result, "Battery %f", batteryLevel);
+      log(result);
+      printOLED(result, 0, 0);
+    } else {
+      printOLED("battery charging", 0, 0);
+    }
     COROUTINE_DELAY_SECONDS(batteryDelay);
   }
 }
+
 
 void writeRecord() {
   record_file = SD.open(FILE_NAME, FILE_WRITE);
@@ -302,8 +310,6 @@ COROUTINE(LowEnergyManager) {
     //inactivity time passed
     if (rtc.getMinutes() >= lastActivity) {
       rtcSleep = true;
-    } else {
-      rtcSleep = false;
     }
     if (rtcSleep == true && GPSUpdated == true) {
       if (SD.exists(FILE_NAME)) {
@@ -350,6 +356,7 @@ void setup() {
   log("End init");
   if (!SD.begin(4)) {
     printOLED("SD Error", 0, 0); log("SD error");
+    delay(2000);
   }
   LowPower.attachInterruptWakeup(PIN_POWER, Wakeup_Sleep, FALLING);
 }
