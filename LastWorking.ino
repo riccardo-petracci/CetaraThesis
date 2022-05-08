@@ -70,7 +70,7 @@ float diValue = 0;        // variable to store the value coming from the divider
 
 static const unsigned long batteryDelay = 60;  //delay coroutine battery in seconds
 static const unsigned long gpsDelay = 600;      //delay coroutine gps in seconds
-static const unsigned long readDelay = 180;     //delay coroutine reading and sending in seconds
+static const unsigned long readDelay = 150;     //delay coroutine reading and sending in seconds
 
 volatile int p;                         //variable for the lowpower
 volatile boolean rtcSleep = false;      //varible used to manage the sleep
@@ -113,28 +113,21 @@ COROUTINE(gps) {  // reading gps value
     forceStop = rtc.getMinutes() + 7;
     while (!GPS.available()) {
       COROUTINE_YIELD();
-      if (rtc.getMinutes() >= (forceStop%60)) {
-        GPSUpdated = true;
-        printOLED("GPS not updated, force stop", 0, 0);
-        break;
-      }
     }
-    if (GPS.available()) {
-      log("Init GPS");
-      printOLED("Updating GPS...", 0, 0);
-      time_t epochTime = GPS.getTime();
-      struct tm now = *localtime(&epochTime);
-      rtc.setDate(now.tm_mday, now.tm_mon + 1, now.tm_year);
-      rtc.setTime(now.tm_hour, now.tm_min, now.tm_sec);
-      lastGPS.time       = GPS.getTime();
-      lastGPS.latitude   = GPS.latitude();
-      lastGPS.longitude  = GPS.longitude();
-      lastGPS.altitude   = GPS.altitude();
-      lastGPS.satellites = GPS.satellites();
-      GPSUpdated = true;
-      printOLED("GPS updated", 0, 0);
-      log("End GPS");
-    }
+    log("Init GPS");
+    printOLED("Updating GPS...", 0, 0);
+    time_t epochTime = GPS.getTime();
+    struct tm now = *localtime(&epochTime);
+    rtc.setDate(now.tm_mday, now.tm_mon + 1, now.tm_year);
+    rtc.setTime(now.tm_hour, now.tm_min, now.tm_sec);
+    lastGPS.time       = GPS.getTime();
+    lastGPS.latitude   = GPS.latitude();
+    lastGPS.longitude  = GPS.longitude();
+    lastGPS.altitude   = GPS.altitude();
+    lastGPS.satellites = GPS.satellites();
+    GPSUpdated = true;
+    printOLED("GPS updated", 0, 0);
+    log("End GPS");
     GPS.standby();
     COROUTINE_DELAY_SECONDS(gpsDelay);
   }
@@ -308,20 +301,25 @@ COROUTINE(readAndSendRecord) {
 COROUTINE(LowEnergyManager) {
   COROUTINE_LOOP() {
     //inactivity time passed
-    if (rtc.getMinutes() >= (lastActivity%60)) {
+    if (rtc.getMinutes() >= (lastActivity % 60)) {
       rtcSleep = true;
+    }
+    if (GPSUpdated == false && rtc.getMinutes() >= (forceStop % 60)) {
+      GPSUpdated = true;
+      printOLED("GPS not updated, force stop", 0, 0);
+      GPS.standby();
     }
     if (rtcSleep == true && GPSUpdated == true) {
       if (SD.exists(FILE_NAME)) {
         printOLED("Sleep\nPress button to\nresume", 0, 0);
         LowPower.sleep(600000);       //10 minutes
         rtcSleep = false;
-        lastActivity = rtc.getMinutes() + 2;
+        lastActivity = rtc.getMinutes() + 5;
       } else {
         printOLED("DeepSleep\nPress button to\nresume", 0, 0);
         LowPower.deepSleep(1200000);  //20 minutes
         rtcSleep = false;
-        lastActivity = rtc.getMinutes() + 2;
+        lastActivity = rtc.getMinutes() + 5;
       }
     }
     COROUTINE_DELAY_SECONDS(30);
@@ -379,4 +377,6 @@ void Wakeup_Sleep() {
   printOLED("Wake up", 0, 0);
   Serial.println("wake up");
   p = 1;
+  rtcSleep = false;
+  lastActivity = rtc.getMinutes() + 5;
 }
