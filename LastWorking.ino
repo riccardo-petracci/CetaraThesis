@@ -324,7 +324,7 @@ COROUTINE(LowEnergyManager) {
         lastActivity = rtc.getMinutes() + 2;
       }
     }
-    COROUTINE_DELAY_SECONDS(5);
+    COROUTINE_DELAY_SECONDS(45);
   }
 }
 
