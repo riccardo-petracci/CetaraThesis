@@ -25,13 +25,12 @@ using namespace ace_routine;
 #define DIM_QRCODE 100             // number of byte of QR code
 #define PIN_POWER  0               // pin 4 for power button
 #define PIN_ACTIVITY 7             // led for activity
-//#define QR_READY  2                // bar code ready with led output
 #define SIZE_RECORD 256            // size of record in flash
 #define PORT 443                   // port 443https 80 http
 #define FILE_NAME "record.txt"     // file name record in flash
 #define FILE_LOG  "log.txt"        // file with success and errors
-#define PINNUMBER "1503"
-#define GPRS_APN "TM"
+#define PINNUMBER "PIN_NUMBER"
+#define GPRS_APN "GPRS_APN"
 #define GPRS_LOGIN ""
 #define GPRS_PASSWORD ""
 
@@ -61,11 +60,11 @@ String uid;
 GSMClient client;
 GSM  gsmAccess;
 GPRS gprs;
-char server[] = "vps-a75923cc.vps.ovh.net";
+char server[] = "server";
 String method = "GET";
-String path = "/qrcode/write1.php?";
+String path = "path";
 int port = 80; // port 80 is the default for HTTP
-String key = "Paperino75";
+String key = "key_string";
 
 int dividerPin = A1;    //pin for the divider
 float diValue = 0;        // variable to store the value coming from the divider
@@ -297,7 +296,7 @@ COROUTINE(readAndSendRecord) {
 
 
 void setup() {
-  Serial.begin(9600); while(!Serial); log("Serial ready");
+  Serial.begin(9600); log("Serial ready");
   Serial1.begin(9600); log("Scanner ready");
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   if (!GPS.begin()) {
