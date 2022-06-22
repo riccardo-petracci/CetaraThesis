@@ -1,0 +1,408 @@
+/*********************/
+/*     LIBRARIES    */
+/********************/
+
+#include <AceRoutine.h>
+#include <Arduino.h>
+using namespace ace_routine;
+
+#include <MicroNMEA.h>
+#include <string.h>
+#include <ArduinoUniqueID.h>  // Device ID
+#include <SPI.h>              // protocol to SD
+#include <SD.h>               // Labrary fo SD
+#include <stdio.h>            // IO        
+#include <Adafruit_GFX.h>     // Display
+#include <Adafruit_SSD1306.h> // Display
+#include <wiring_private.h>   // Second serial
+#include "ArduinoLowPower.h"  // LowEnergy
+#include <MD5.h>
+#include <RTCZero.h>
+
+/*********************/
+/*    DEFINITIONS   */
+/********************/
+
+#define DEBUG                 true // false <<<=============
+#define SSD1306_128_64             // OLED display model
+#define SCREEN_WIDTH 128           // OLED display width, in pixels
+#define SCREEN_HEIGHT 64           // OLED display height, in pixels
+#define FILE_NAME "record.txt"     // file name record in SD card
+
+/*********************/
+/*     VARIABLES    */
+/********************/
+
+typedef struct { // GPS values
+  unsigned long time;
+  float  latitude;
+  float  longitude;
+  float  altitude;
+  int    satellites;
+} position;
+
+File record_file;
+position lastGPS;                 // last GPS value
+RTCZero rtc;                      // Real Time Clock
+Adafruit_SSD1306 display(4);      // Oled reset
+String uid;
+
+static const unsigned long batteryDelay = 60;  //delay coroutine battery in seconds
+static const unsigned long gpsDelay = 600;      //delay coroutine gps in seconds
+static const unsigned long readDelay = 150;     //delay coroutine reading and sending in seconds
+
+volatile int p;                         //variable for the lowpower
+volatile boolean rtcSleep = false;      //varible used to manage the sleep
+volatile boolean GPSUpdated = false;    //variable used to trace GPS update
+
+volatile int lastActivity = 0;        //inactivity variable
+volatile int forceStop = 0;           //Forcing GPS
+
+String server = "host.host";
+String path = "path?";
+String key = "String key";
+
+char buffer[85];
+MicroNMEA nmea(buffer, sizeof(buffer));
+
+float latitude_mdeg ;
+float longitude_mdeg ;
+
+int PWR_KEY = 9;
+int RST_KEY = 6;
+int LOW_PWR_KEY = 5;
+bool ModuleState = false;
+
+/*********************/
+/*      SETUP       */
+/********************/
+
+void setup() {
+
+  pinMode(PWR_KEY, OUTPUT);
+  pinMode(RST_KEY, OUTPUT);
+  pinMode(LOW_PWR_KEY, OUTPUT);
+  digitalWrite(RST_KEY, LOW);
+  digitalWrite(LOW_PWR_KEY, HIGH);
+  digitalWrite(PWR_KEY, HIGH);
+
+  SerialUSB.begin(115200); while (!SerialUSB); SerialUSB.println("SerialUSB ready");
+  Serial1.begin(115200);
+
+  digitalWrite(PWR_KEY, LOW);
+  delay(3000);
+  digitalWrite(PWR_KEY, HIGH);
+  delay(5000);
+  ModuleState = moduleStateCheck();
+  if (ModuleState == false) { //if it's off, turn on it.
+    digitalWrite(PWR_KEY, LOW);
+    delay(3000);
+    digitalWrite(PWR_KEY, HIGH);
+    delay(5000);
+    SerialUSB.println("Now turnning the A9/A9G on.");
+  }
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  rtc.begin();
+  sendData("AT+GPS=1", 1000, DEBUG);//1: turn on GPS  0:Turn off GPS
+  sendData("AT+CGDCONT=1,\"IP\",\"TM\"", 2000, DEBUG);
+
+  //UNIQUEID
+  byte buffer[100];
+  for (size_t i = 0; i < UniqueIDsize; i++)
+  {
+    buffer[i] = UniqueID[i];
+    uid += String(buffer[i], HEX);
+  }
+  uid.toUpperCase();
+  SerialUSB.print("UniqueID: ");
+  SerialUSB.println(uid);
+  printOLED("Ready", 0, 0);
+  if (!SD.begin(4)) {
+    printOLED("SD Error", 0, 0);
+    SerialUSB.println("SD init error");
+    while (1);
+  }
+  //LowPower.attachInterruptWakeup(PIN_POWER, Wakeup_Sleep, FALLING);
+}
+
+/*********************/
+/*    COROUTINES    */
+/********************/
+
+COROUTINE(gps) {  // reading gps value
+  COROUTINE_LOOP() {
+    GPSUpdated = false;
+    SerialUSB.println("WakeUp GPS");
+    sendData("AT+GPS=1", 1000, DEBUG);
+    delay(300);
+    Serial1.println("AT+GPSRD=1");
+    delay(500);
+    while (Serial1.available() > 0)
+    {
+      char inByte = Serial1.read(); // Get GPS data
+      if (DEBUG) {
+        SerialUSB.print(inByte);
+      }
+      nmea.process(inByte);
+    }
+    SerialUSB.print("\nValid fix: ");
+    SerialUSB.println(nmea.isValid() ? "yes" : "no");
+    if (nmea.isValid()) {
+      SerialUSB.println("GPS updating information");
+      printOLED("GPS info updating", 0, 0);
+      rtc.setTime(nmea.getHour(), nmea.getMinute(), nmea.getSecond()); //h , m , s
+      rtc.setDate(nmea.getDay(), nmea.getMonth(), nmea.getYear() - 16); //d , m , y
+      lastGPS.time       = rtc.getEpoch();
+
+      latitude_mdeg = nmea.getLatitude();
+      latitude_mdeg = latitude_mdeg / 1000000.;
+      lastGPS.latitude   = latitude_mdeg;
+
+      longitude_mdeg = nmea.getLongitude();
+      longitude_mdeg = longitude_mdeg / 1000000.;
+      lastGPS.longitude  = longitude_mdeg;
+      lastGPS.altitude   = 0;
+      lastGPS.satellites = nmea.getNumSatellites();
+
+      SerialUSB.println("GPS value updated");
+      printOLED("GPS value updated", 0, 0);
+
+      //Printing values
+      if (DEBUG) {
+        SerialUSB.println("GPS data from lastGPS");
+        SerialUSB.print("Latitude (deg): ");
+        SerialUSB.println(lastGPS.latitude);
+        SerialUSB.print("Longitude (deg): ");
+        SerialUSB.println(lastGPS.longitude);
+        SerialUSB.print("Satellites: ");
+        SerialUSB.println(lastGPS.satellites);
+
+        SerialUSB.println("\n Data/Time value from rtc");
+        SerialUSB.print(rtc.getYear());
+        SerialUSB.print('-');
+        SerialUSB.print(int(rtc.getMonth()));
+        SerialUSB.print('-');
+        SerialUSB.print(int(rtc.getDay()));
+        SerialUSB.print('T');
+        SerialUSB.print(int(rtc.getHours()));
+        SerialUSB.print(':');
+        SerialUSB.print(int(rtc.getMinutes()));
+        SerialUSB.print(':');
+        SerialUSB.println(int(rtc.getSeconds()));
+        SerialUSB.print("unixtime: ");
+        SerialUSB.println(lastGPS.time);
+      }
+      Serial1.println("AT+GPSRD=0");
+      Serial1.println("AT+GPS=0");
+      GPSUpdated = true;
+      COROUTINE_DELAY_SECONDS(gpsDelay);
+    } else {
+      Serial1.println("AT+GPSRD=0");
+      COROUTINE_DELAY_SECONDS(30);
+    }
+  }
+}
+
+/*COROUTINE(serialScanerEvent) { //Read QRCodes
+  COROUTINE_LOOP() {
+    diValue = analogRead(dividerPin);
+    float voltage = diValue * (5.0 / 1023.0);
+    if (voltage > 3.0) {
+      while (Serial1.available() > 0) {
+        char inChar = (char)Serial1.read();
+        QRCode += inChar;
+        countstr++;
+        millisendstr = millis();
+      }
+      COROUTINE_YIELD();
+      if (millis() - millisendstr > 1000 && countstr > 0) {
+        stringComplete = true;
+        if (QRCode != QRCode_old) { // anti aliasing
+          QRCode_old = QRCode;
+          printOLED("QRCode acquired", 0, 0);
+          digitalWrite(LED_BUILTIN, HIGH);
+          delay(500);
+          digitalWrite(LED_BUILTIN, LOW);
+        }
+        writeRecord();
+      }
+    }
+    COROUTINE_DELAY_SECONDS(2);
+  }
+  }*/
+
+COROUTINE(readAndSendRecord) {
+  COROUTINE_LOOP() {
+    if (SD.exists(FILE_NAME)) {
+      SerialUSB.println("Connecting...");
+      printOLED("Connecting GPRS...", 0, 0);
+
+      sendData("AT+CREG?", 1000, DEBUG);
+      sendData("AT+CCID", 1000, DEBUG);
+      sendData("AT+CGATT=1", 1000, DEBUG);
+      sendData("AT+CGACT=1,1", 1000, DEBUG);
+      //sendData("AT+CIPSTART=\"TCP\",\"vps-a75923cc.vps.ovh.net\",80", 1000, DEBUG);
+      //COROUTINE_YIELD();
+      String response = "";
+      Serial1.println("AT+CIPSTART=\"TCP\",\"vps-a75923cc.vps.ovh.net\",80");
+      long int time = millis();
+      while ((time + 2000) > millis()) {
+        while (Serial1.available()) {
+          char c = Serial1.read();
+          response += c;
+        }
+      }
+      if (DEBUG) {
+        SerialUSB.print(response);
+      }
+      if (response.indexOf("CONNECT") > 0) {
+        int i = 1;
+        record_file = SD.open(FILE_NAME, FILE_READ);
+        record_file.seek(0);
+        while (1) {
+          printOLED("Sending data\nto server . . .", 0, 0);
+          String dataToGet = fscanf(record_file);
+          if (dataToGet == "") {
+            record_file.close();
+            delay(500);
+            SD.remove(FILE_NAME);
+            delay(500);
+            SerialUSB.println("Buffer removed");
+            printOLED("Buffer removed", 0, 0);
+            i = 0;
+            break;
+          }
+          String secret = dataToGet + key;
+          SerialUSB.println(secret);
+          char charBuf[250];
+          secret.toCharArray(charBuf, 250);
+          unsigned char* hash = MD5::make_hash(charBuf);
+          char *md5str = MD5::make_digest(hash, 16);
+          free(hash);
+          String cmdToSend = "AT+HTTPGET=\"http://vps-a75923cc.vps.ovh.net/qrcode/write1.php?" + dataToGet + "&z=" + md5str  + "\"";
+          response = "";
+          time = millis();
+          Serial1.println(cmdToSend);
+          while ((time + 4000) > millis()) {
+            while (Serial1.available()) {
+              char c = Serial1.read();
+              response += c;
+            }
+          }
+          if (DEBUG) {
+            SerialUSB.println(response);
+          }
+          free(md5str);
+          if (response.indexOf("Dns,fail") > 0) {
+            SerialUSB.println("Data sending failed");
+            break;
+          }
+          //COROUTINE_YIELD();
+        }
+      } else {
+        SerialUSB.println("Connection error");
+        printOLED("Connection error", 0, 0);
+      }
+    }
+    COROUTINE_DELAY_SECONDS(readDelay);
+  }
+}
+
+
+/*********************/
+/*      METHODS     */
+/********************/
+
+void writeRecord() {
+  record_file = SD.open(FILE_NAME, FILE_WRITE);
+  const int wait = 5;
+  String str;
+  str += "device=" + uid + "&";
+  str += "unixtime=" + String(lastGPS.time) + "&";
+  str += "latitude=" + String(lastGPS.latitude) + "&";
+  str += "longitude=" + String(lastGPS.longitude) + "&";
+  str += "altitude=" + String(lastGPS.altitude) + "&";
+  str += "satellites=" + String(lastGPS.satellites) + "&";
+  //str += "rfid=" + String(QRCode);
+  //QRCode = "";
+  //stringComplete = false;
+  //countstr = 0;
+  record_file.println(str);
+  record_file.flush();
+  record_file.close();
+  //log(str);
+  printOLED("Record Writte", 0, 0);
+  lastActivity = rtc.getMinutes() + wait;
+}
+
+/*void Wakeup_Sleep() {
+  printOLED("Wake up", 0, 0);
+  Serial.println("wake up");
+  p = 1;
+  rtcSleep = false;
+  lastActivity = rtc.getMinutes() + 5;
+  }*/
+
+String fscanf(File f) { //purificatore
+  String s = "";
+  while (f.available()) {
+    char ch = f.read();
+    if (ch == '\n') return s;
+    else if (ch == '\r') {
+      ;
+    }
+    else s += ch;
+  }
+}
+
+String sendData(String command, const int timeout, boolean debug) {
+  String response = "";
+  Serial1.println(command);
+  long int time = millis();
+  while ((time + timeout) > millis()) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      response += c;
+    }
+  }
+  if (debug) {
+    SerialUSB.print(response);
+  }
+  return response;
+}
+
+void printOLED(char *t, int r, int c) { // write display message
+  display.clearDisplay();  //Pulisce il buffer da inviare al display
+  display.setTextSize(1);  //Imposta la grandezza del testo (1-8)
+  display.setTextColor(WHITE); //Imposta il colore del testo (Solo bianco)
+  display.setCursor(r, c); //Imposta la posizione del cursore (Larghezza,Altezza)
+  display.println(t); //Stringa da visualizzare
+  display.display(); //Invia il buffer da visualizzare al display
+}
+
+bool moduleStateCheck() {
+  int i = 0;
+  bool state = false;
+  for (i = 0; i < 10; i++)
+  {
+    String msg = String("");
+    msg = sendData("AT", 1000, DEBUG);
+    if (msg.indexOf("OK") >= 0)
+    {
+      SerialUSB.println("A9/A9G Module had turned on.");
+      state = true;
+      return state;
+    }
+    delay(500);
+  }
+  return state;
+}
+
+void loop() {
+  gps.runCoroutine();
+  //battery.runCoroutine();
+  //serialScanerEvent.runCoroutine();
+  readAndSendRecord.runCoroutine();
+  //LowEnergyManager.runCoroutine();
+}
