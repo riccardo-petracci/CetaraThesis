@@ -3,4 +3,3 @@ Goals:
  - scan RFID fish boxes.
  - add GPS data information to RFID scanned before.
  - send all data with GPRS using HTTP GET request (query string).
- - use a low power duty cycle to reduce energy consumption.
