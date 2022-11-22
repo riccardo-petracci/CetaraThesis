@@ -1,0 +1,732 @@
+/********************************************************************************************/
+/*  Official Release with RFID module, QRCode module, check duplicate code mechanism,       */
+/*  LED status: white LED -> ack code saved or duplicated                                   */
+/*              red LED   -> when user can't scan code                                      */
+/********************************************************************************************/
+
+
+
+/*********************/
+/*     LIBRARIES    */
+/********************/
+
+#include <AceRoutine.h>
+#include <Arduino.h>
+using namespace ace_routine;
+
+#include <LinkedList.h>
+#include <MicroNMEA.h>
+#include <string.h>
+#include <ArduinoUniqueID.h>  // Device ID
+#include <SPI.h>              // protocol to SD
+#include <SD.h>               // Labrary fo SD
+#include <stdio.h>            // IO 
+#include <Wire.h>
+#include "wiring_private.h"   // pinPeripheral() function
+#include "ArduinoLowPower.h"  // LowEnergy
+#include <MD5.h>
+#include <RTCZero.h>
+#include "SparkFun_UHF_RFID_Reader.h" //Library for controlling the M6E Nano module
+
+/*********************/
+/*    DEFINITIONS   */
+/********************/
+
+#define DEBUG        true             // false <<<=============
+#define FILE_NAME    "cetara.txt"     // file name record in SD card
+#define SWITCH A0
+#define LED 12      //LED ack read tag
+#define LEDRED 13   //LED possibility read or not
+#define SD_CS 4
+
+/*********************/
+/*     VARIABLES    */
+/********************/
+
+typedef struct { // GPS values
+  float  latitude;
+  float  longitude;
+  float  altitude;
+  int    satellites;
+} position;
+
+File record_file;
+position lastGPS;                 // last GPS value
+RTCZero rtc;                      // Real Time Clock
+
+RFID nano; //Create instance
+String code;
+Uart mySerial(&sercom2, 3, 2, SERCOM_RX_PAD_1, UART_TX_PAD_2);//D2-TX, D3-RX
+Uart qrSerial (&sercom1, 11, 10, SERCOM_RX_PAD_0, UART_TX_PAD_2); //D11-TX, D10-RX
+
+String uid;
+
+static const unsigned long gpsDelay = 600;      //delay coroutine gps in seconds
+
+String server = "vps-0fde778b.vps.ovh.net";
+String path = "/qrcode/write1.php?";
+String key = "Paperino75";
+
+char buffer[85];
+MicroNMEA nmea(buffer, sizeof(buffer));
+
+float latitude_mdeg ;
+float longitude_mdeg ;
+
+int PWR_KEY = 9;
+int RST_KEY = 6;
+int LOW_PWR_KEY = 5;
+bool ModuleState = false;
+int val = 0; //set val to 0
+
+int needReset = 0;  //variable to count time we need to do reset
+int txtLineTracker = 0;
+
+LinkedList<String> RFIDRecords = LinkedList<String>();
+
+/*********************/
+/*      SETUP       */
+/********************/
+
+void SERCOM1_Handler()
+{
+  qrSerial.IrqHandler();
+}
+
+void SERCOM2_Handler()
+{
+  mySerial.IrqHandler();
+}
+
+void setup() {
+
+  pinMode(PWR_KEY, OUTPUT);
+  pinMode(RST_KEY, OUTPUT);
+  pinMode(LOW_PWR_KEY, OUTPUT);
+  pinMode(LED, OUTPUT);
+  pinMode(LEDRED, OUTPUT);
+  pinMode(SWITCH, INPUT);
+  digitalWrite(RST_KEY, LOW);
+  digitalWrite(LOW_PWR_KEY, HIGH);
+  digitalWrite(PWR_KEY, HIGH);
+  digitalWrite(LED, HIGH);
+
+  SerialUSB.begin(115200); //while (!SerialUSB);
+  if (DEBUG) {
+    SerialUSB.println("SerialUSB ready");
+  }
+  Serial1.begin(115200);
+  rtc.begin();
+  rtc.setEpoch(1669042614); // Nov 21, 2022
+
+  //UNIQUEID
+  byte buffer[100];
+  for (size_t i = 0; i < UniqueIDsize; i++)
+  {
+    buffer[i] = UniqueID[i];
+    uid += String(buffer[i], HEX);
+  }
+  uid.toUpperCase();
+  if (DEBUG) {
+    SerialUSB.print("UniqueID: ");
+    SerialUSB.println(uid);
+  }
+
+  if (!SD.begin(SD_CS)) {
+    SerialUSB.println("SD init error");
+    while (1);
+  }
+
+  //RFID setup
+  //Because we are using a hardware SerialUSB port in this example we can
+  //push the SerialUSB speed much faster to 115200bps
+
+  if (setupNano(38400) == false) //Configure nano to run at 115200bps
+  {
+    SerialUSB.println(F("Module failed to respond. Please check wiring."));
+    //while (1); //Freeze!
+  }
+
+  nano.setRegion(REGION_NORTHAMERICA); //Set to North America
+  nano.setReadPower(2700); //5.00 dBm. Higher values may caues USB port to brown out
+  nano.startReading(); //Begin scanning for tags
+
+  testRFID();
+
+  //poi spegnimento
+  digitalWrite(PWR_KEY, LOW);
+  delay(3000);
+  digitalWrite(PWR_KEY, HIGH);
+  delay(5000);
+  ModuleState = moduleStateCheck();
+  if (ModuleState == false) { //if it's off, turn on it.
+    digitalWrite(PWR_KEY, LOW);
+    delay(3000);
+    digitalWrite(PWR_KEY, HIGH);
+    delay(5000);
+    if (DEBUG) {
+      SerialUSB.println("Now turnning the A9/A9G on.");
+    }
+  }
+
+  while (true) {
+    if (setupNano(38400) == false) //Configure nano to run at 115200bps
+    {
+      SerialUSB.println(F("Module failed to respond. Please check wiring."));
+      //while (1); //Freeze!
+    } else {
+      SerialUSB.println("RFID ready");
+      break;
+    }
+  }
+
+  nano.setRegion(REGION_NORTHAMERICA); //Set to North America
+
+  nano.setReadPower(2700); //5.00 dBm. Higher values may caues USB port to brown out
+  //Max Read TX Power is 27.00 dBm and may cause temperature-limit throttling
+
+  //setup QRCode scanner
+  qrSerial.begin(115200); while (!qrSerial);
+
+  // Assign pins 10 & 11 SERCOM functionality
+  pinPeripheral(10, PIO_SERCOM);
+  pinPeripheral(11, PIO_SERCOM);
+  if (DEBUG) {
+    SerialUSB.println("Scanner QR ready");
+  }
+
+  digitalWrite(LED, LOW);
+  digitalWrite(LEDRED, HIGH);
+  if (DEBUG) {
+    SerialUSB.println("Maduino ready");
+  }
+}
+
+/*********************/
+/*    COROUTINES    */
+/********************/
+
+COROUTINE(gps) {  // reading gps value
+  COROUTINE_LOOP() {
+    digitalWrite(LEDRED, HIGH);
+    if (DEBUG) {
+      SerialUSB.println("WakeUp GPS");
+    }
+    sendData("AT+GPS=1", 2000, DEBUG);
+    sendData("AT+GPSRD=1", 2000, DEBUG);
+    while (Serial1.available() > 0)
+    {
+      char inByte = Serial1.read(); // Get GPS data
+      if (DEBUG) {
+        if (DEBUG) {
+          SerialUSB.print(inByte);
+        }
+      }
+      nmea.process(inByte);
+    }
+    if (DEBUG) {
+      SerialUSB.print("\nValid fix: ");
+      SerialUSB.println(nmea.isValid() ? "yes" : "no");
+    }
+    if (nmea.isValid()) {
+      if (DEBUG) {
+        SerialUSB.println("GPS updating information");
+      }
+      rtc.setTime(nmea.getHour(), nmea.getMinute(), nmea.getSecond()); //h , m , s
+      rtc.setDate(nmea.getDay(), nmea.getMonth(), nmea.getYear() - 16); //d , m , y
+
+      latitude_mdeg = nmea.getLatitude();
+      latitude_mdeg = latitude_mdeg / 1000000.;
+      lastGPS.latitude   = latitude_mdeg;
+
+      longitude_mdeg = nmea.getLongitude();
+      longitude_mdeg = longitude_mdeg / 1000000.;
+      lastGPS.longitude  = longitude_mdeg;
+      lastGPS.altitude   = 0;
+      lastGPS.satellites = nmea.getNumSatellites();
+
+      SerialUSB.println("GPS value updated");
+      //Printing values
+      if (DEBUG) {
+        SerialUSB.println("GPS data from lastGPS");
+        SerialUSB.print("Latitude (deg): ");
+        SerialUSB.println(lastGPS.latitude);
+        SerialUSB.print("Longitude (deg): ");
+        SerialUSB.println(lastGPS.longitude);
+        SerialUSB.print("Satellites: ");
+        SerialUSB.println(lastGPS.satellites);
+
+        SerialUSB.println("\n Data/Time value from rtc");
+        SerialUSB.print(rtc.getYear());
+        SerialUSB.print('-');
+        SerialUSB.print(int(rtc.getMonth()));
+        SerialUSB.print('-');
+        SerialUSB.print(int(rtc.getDay()));
+        SerialUSB.print('T');
+        SerialUSB.print(int(rtc.getHours()));
+        SerialUSB.print(':');
+        SerialUSB.print(int(rtc.getMinutes()));
+        SerialUSB.print(':');
+        SerialUSB.println(int(rtc.getSeconds()));
+        SerialUSB.print("unixtime: ");
+        SerialUSB.println(rtc.getEpoch());
+      }
+      sendData("AT+GPSRD=0", 2000, DEBUG);
+      sendData("AT+GPS=0", 2000, DEBUG);
+      digitalWrite(LEDRED, LOW);
+      COROUTINE_DELAY_SECONDS(gpsDelay);
+    } else {
+      sendData("AT+GPSRD=0", 2000, DEBUG);
+      COROUTINE_DELAY_SECONDS(45);
+    }
+  }
+}
+
+COROUTINE(RFIDScan) { //Read QRCodes
+  COROUTINE_LOOP() {
+    val = analogRead(SWITCH);
+    if (DEBUG) {
+      SerialUSB.print("analog read: ");
+      SerialUSB.println(val);
+    }
+    if (val > 800) {
+      byte myEPC[12]; //Most EPCs are 12 bytes
+      byte myEPClength;
+      byte responseType = 0;
+
+      myEPClength = sizeof(myEPC); //Length of EPC is modified each time .readTagEPC is called
+      if (DEBUG) {
+        SerialUSB.println(F("Searching for tag"));
+      }
+      responseType = nano.readTagEPC(myEPC, myEPClength, 500); //Scan for a new tag up to 500ms
+
+      if (responseType == RESPONSE_SUCCESS) {
+        //Print EPC
+        SerialUSB.print(F(" epc["));
+        for (byte x = 0 ; x < myEPClength ; x++) {
+          if (myEPC[x] < 0x10) {
+            SerialUSB.print(F("0"));
+            code += "0";
+          }
+          SerialUSB.print(myEPC[x], HEX);
+          code += String(myEPC[x], HEX);
+          SerialUSB.print(F(" "));
+        }
+        SerialUSB.println(F("]"));
+        SerialUSB.print("EPC in stringa: ");
+        SerialUSB.println(code);
+        writeRecord();
+        code = "";
+      } else {
+        if (DEBUG) {
+          SerialUSB.println("No tag found");
+        }
+      }
+    } else {
+      if (DEBUG) {
+        SerialUSB.println("Not reading");
+      }
+    }
+    COROUTINE_DELAY_SECONDS(1);
+  }
+}
+
+COROUTINE(QRScan) { //Read QRCodes
+  COROUTINE_LOOP() {
+    val = analogRead(SWITCH);
+    if (DEBUG) {
+      SerialUSB.print("analog read qr: ");
+      SerialUSB.println(val);
+    }
+    if (val > 800) {
+      String tempCode;
+      if (qrSerial.available()) {
+        while (qrSerial.available()) {
+          char inChar = (char)qrSerial.read();
+          tempCode += inChar;
+        }
+        if (DEBUG) {
+          SerialUSB.println(tempCode);
+        }
+        code = tempCode.substring(tempCode.indexOf("qrcode=") + 7);
+        SerialUSB.println(code);
+        if (code.length() > 3 && code != "" && code.indexOf("?") <= 0) {
+          writeRecord();
+        } else {
+          SerialUSB.println("QRCode non valido");
+        }
+        code = "";
+      }
+    }
+    COROUTINE_DELAY_SECONDS(1);
+  }
+}
+
+COROUTINE(readAndSendRecord) {
+  COROUTINE_LOOP() {
+    val = analogRead(SWITCH);
+    if (DEBUG) {
+      SerialUSB.print("val readSend: ");
+      SerialUSB.println(val);
+    }
+    if (val < 800) {
+      if (SD.exists(FILE_NAME)) {
+        digitalWrite(LEDRED, HIGH);
+        if (DEBUG) {
+          SerialUSB.println("Connecting...");
+        }
+        sendData("AT+CREG?", 1000, DEBUG);
+        sendData("AT+CGATT=1", 1000, DEBUG);
+        sendData("AT+CGDCONT=1,\"IP\",\"TM\"", 1000, DEBUG);
+        sendData("AT+CGACT=1,1", 1000, DEBUG);
+
+        String response = "";
+        Serial1.println("AT+CREG?");
+        long int time = millis();
+        while ((time + 2000) > millis()) {
+          while (Serial1.available()) {
+            char c = Serial1.read();
+            response += c;
+          }
+        }
+        if (DEBUG) {
+          SerialUSB.print(response);
+        }
+        if (response.indexOf("1,1") > 0 | response.indexOf("1,5") > 0) {
+          record_file = SD.open(FILE_NAME, FILE_READ);
+          record_file.seek(txtLineTracker);
+          if (DEBUG) {
+            SerialUSB.print("txtLineTracker: ");
+            SerialUSB.println(txtLineTracker);
+          }
+          while (1) {
+            String dataToGet = fscanf(record_file);
+            if (dataToGet == "") {
+              if (DEBUG) {
+                SerialUSB.println("Buffer removed");
+              }
+              record_file.close();
+              delay(500);
+              SD.remove(FILE_NAME);
+              delay(500);
+              txtLineTracker = 0;
+              digitalWrite(LEDRED, LOW);
+              break;
+            }
+            String secret = dataToGet + key;
+            SerialUSB.println(secret);
+            char charBuf[250];
+            secret.toCharArray(charBuf, 250);
+            unsigned char* hash = MD5::make_hash(charBuf);
+            char *md5str = MD5::make_digest(hash, 16);
+            free(hash);
+            String cmdToSend = "AT+HTTPGET=\"http://vps-0fde778b.vps.ovh.net/qrcode/write1.php?" + dataToGet + "&z=" + md5str  + "\"";
+            String response = "";
+            long time = millis();
+            Serial1.println(cmdToSend);
+            while ((time + 7000) > millis()) {
+              while (Serial1.available()) {
+                char c = Serial1.read();
+                response += c;
+              }
+            }
+            if (DEBUG) {
+              SerialUSB.println(response);
+            }
+            free(md5str);
+            if (response.indexOf("Dns,fail") > 0) {
+              SerialUSB.println("Data sending failed");
+              digitalWrite(LEDRED, LOW);
+              break;
+            }
+            txtLineTracker = txtLineTracker + dataToGet.length() + 2;
+            if (DEBUG) {
+              SerialUSB.print("txtLineTracker: ");
+              SerialUSB.println(txtLineTracker);
+            }
+            digitalWrite(LEDRED, LOW);
+            break;
+          }
+        } else {
+          SerialUSB.println("Connection error");
+          needReset ++;
+          SerialUSB.print("Need Reset: ");
+          SerialUSB.println(needReset);
+          if (needReset >= 7) {
+            needReset = 0;
+            SerialUSB.println("Doing Reboot");
+            sendData("AT+RST=1", 10000, DEBUG); //soft restart Init..
+          }
+          digitalWrite(LEDRED, LOW);
+        }
+      }
+    }
+    COROUTINE_DELAY_SECONDS(60);
+  }
+}
+
+/*********************/
+/*      METHODS     */
+/********************/
+
+void writeRecord() {
+  digitalWrite(LEDRED, HIGH);
+  record_file = SD.open(FILE_NAME, FILE_WRITE);
+  String str;
+  if (record_file) {
+    str += "device=" + uid + "&";
+    str += "unixtime=" + String(rtc.getEpoch()) + "&";
+    str += "latitude=" + String(lastGPS.latitude) + "&";
+    str += "longitude=" + String(lastGPS.longitude) + "&";
+    str += "altitude=" + String(lastGPS.altitude) + "&";
+    str += "satellites=" + String(lastGPS.satellites) + "&";
+    str += "qrcode=" + String(code);
+
+    String subStr;
+    subStr = String(code);
+
+    //using linkedList to improve writeRecord() method QoL.
+
+    if (RFIDRecords.size() == 0) {
+      RFIDRecords.add(str);
+      record_file.println(str);
+      record_file.close();
+      if (DEBUG) {
+        SerialUSB.println(str);
+      }
+
+      //show tag found with led blink 2 times
+      for (int i = 0; i < 2 ; i++) {
+        digitalWrite(LED, HIGH);
+        delay(500);
+        digitalWrite(LED, LOW);
+        delay(500);
+      }
+    }
+    else { //check duplicates
+      for (int i = 0; i < RFIDRecords.size() + 1; i++) {
+        String tempStr = RFIDRecords.get(i);
+        String subTempStr = tempStr.substring(tempStr.indexOf("qrcode=") + 7);
+        if (DEBUG) {
+          SerialUSB.print("subTempStr: ");
+          SerialUSB.println(subTempStr);
+          SerialUSB.print("subStr: ");
+          SerialUSB.println(subStr);
+        }
+        if (subTempStr.equals(subStr) == true) { //NB. equals case sensitive equalsIgnoreCase() NO
+          if (DEBUG) {
+            Serial.println("Codice duplicato");
+          }
+          //show tag found with led blink 5 times
+          for (int i = 0; i < 5 ; i++) {
+            digitalWrite(LED, HIGH);
+            delay(100);
+            digitalWrite(LED, LOW);
+            delay(100);
+          }
+          break;
+        }
+        if (subTempStr.equals(subStr) == false && i == RFIDRecords.size()) {
+          Serial.println("Codice non duplicato");
+          RFIDRecords.add(str);
+          record_file.println(str);
+          record_file.close();
+          if (DEBUG) {
+            SerialUSB.println(str);
+          }
+
+          //show tag found with led blink 2 times
+          for (int i = 0; i < 2 ; i++) {
+            digitalWrite(LED, HIGH);
+            delay(500);
+            digitalWrite(LED, LOW);
+            delay(500);
+          }
+          break;
+        }
+      }
+    }
+
+    //test
+    if (DEBUG) {
+      SerialUSB.print("List size: ");
+      SerialUSB.println(RFIDRecords.size());
+      String test = RFIDRecords.get(RFIDRecords.size() - 1);
+      SerialUSB.println(test);
+    }
+    //end test
+
+  } else {
+    record_file.close();
+  }
+  if (DEBUG) {
+    // re-open the file for reading:
+    record_file = SD.open(FILE_NAME);
+    if (record_file) {
+      SerialUSB.println("List record file:");
+      // read from the file until there's nothing else in it:
+      while (record_file.available()) {
+        SerialUSB.write(record_file.read());
+      }
+      // close the file:
+      record_file.close();
+    } else {
+      // if the file didn't open, print an error:
+      SerialUSB.println("error opening record.txt");
+      delay(3000);
+    }
+  }
+  digitalWrite(LEDRED, LOW);
+}
+
+String fscanf(File f) { //purificatore
+  String s = "";
+  while (f.available()) {
+    char ch = f.read();
+    if (ch == '\n') return s;
+    else if (ch == '\r') {
+      ;
+    }
+    else s += ch;
+  }
+}
+
+String sendData(String command, const int timeout, boolean debug) {
+  String response = "";
+  Serial1.println(command);
+  long int time = millis();
+  while ((time + timeout) > millis()) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      response += c;
+    }
+  }
+  if (debug) {
+    SerialUSB.print(response);
+  }
+  return response;
+}
+
+bool moduleStateCheck() {
+  int i = 0;
+  bool state = false;
+  for (i = 0; i < 10; i++)
+  {
+    String msg = String("");
+    msg = sendData("AT", 1000, DEBUG);
+    if (msg.indexOf("OK") >= 0)
+    {
+      SerialUSB.println("A9/A9G Module had turned on.");
+      state = true;
+      return state;
+    }
+    delay(500);
+  }
+  return state;
+}
+
+//test RFID reading
+void testRFID() {
+  if (nano.check() == true) { //Check to see if any new data has come in from module
+    byte responseType = nano.parseResponse(); //Break response into tag ID, RSSI, frequency, and timestamp
+    if (responseType == RESPONSE_IS_KEEPALIVE) {
+      SerialUSB.println(F("Scanning"));
+    }
+    else if (responseType == RESPONSE_IS_TAGFOUND) {
+      //If we have a full record we can pull out the fun bits
+      int rssi = nano.getTagRSSI(); //Get the RSSI for this tag read
+      long freq = nano.getTagFreq(); //Get the frequency this tag was detected at
+      long timeStamp = nano.getTagTimestamp(); //Get the time this was read, (ms) since last keep-alive message
+      byte tagEPCBytes = nano.getTagEPCBytes(); //Get the number of bytes of EPC from response
+      SerialUSB.print(F(" rssi["));
+      SerialUSB.print(rssi);
+      SerialUSB.print(F("]"));
+      SerialUSB.print(F(" freq["));
+      SerialUSB.print(freq);
+      SerialUSB.print(F("]"));
+      SerialUSB.print(F(" time["));
+      SerialUSB.print(timeStamp);
+      SerialUSB.print(F("]"));
+      //Print EPC bytes, this is a subsection of bytes from the response/msg array
+      SerialUSB.print(F(" epc["));
+      for (byte x = 0 ; x < tagEPCBytes ; x++) {
+        if (nano.msg[31 + x] < 0x10) SerialUSB.print(F("0")); //Pretty print
+        SerialUSB.print(nano.msg[31 + x], HEX);
+        SerialUSB.print(F(" "));
+      }
+      SerialUSB.print(F("]"));
+      SerialUSB.println();
+      delay(1000);
+    }
+    else if (responseType == ERROR_CORRUPT_RESPONSE) {
+      SerialUSB.println("Bad CRC");
+    } else {
+      //Unknown response
+      SerialUSB.print("Unknown error");
+    }
+  }
+}
+
+//Gracefully handles a reader that is already configured and already reading continuously
+//Because Stream does not have a .begin() we have to do this outside the library
+boolean setupNano(long baudRate)
+{
+  nano.enableDebugging(SerialUSB); //Print the debug statements to the SerialUSB port
+
+  nano.begin(mySerial);
+  delay(1000);
+  //Test to see if we are already connected to a module
+  //This would be the case if the Arduino has been reprogrammed and the module has stayed powered
+
+  //Hardware serial
+  mySerial.begin(baudRate); //For this test, assume module is already at our desired baud rate
+  pinPeripheral(2, PIO_SERCOM);
+  pinPeripheral(3, PIO_SERCOM_ALT);
+  while (!mySerial);
+
+  //About 200ms from power on the module will send its firmware version at 115200. We need to ignore this.
+  while (mySerial.available()) mySerial.read();
+
+  nano.getVersion();
+
+  if (nano.msg[0] == ERROR_WRONG_OPCODE_RESPONSE)
+  {
+    //This happens if the baud rate is correct but the module is doing a ccontinuous read
+    nano.stopReading();
+    delay(1000);
+
+    SerialUSB.println(F("Module continuously reading. Asking it to stop..."));
+
+    delay(1500);
+  }
+  else
+  {
+    //The module did not respond so assume it's just been powered on and communicating at 115200bps
+    mySerial.begin(115200); //Start serial at 115200
+    pinPeripheral(2, PIO_SERCOM);
+    pinPeripheral(3, PIO_SERCOM_ALT);
+    nano.setBaud(baudRate); //Tell the module to go to the chosen baud rate. Ignore the response msg
+    mySerial.begin(baudRate); //Start the serial port, this time at user's chosen baud rate
+    delay(250);
+  }
+
+  //Test the connection
+  nano.getVersion();
+  delay(1000);
+
+  if (nano.msg[0] != ALL_GOOD) return (false); //Something is not right
+
+  //The M6E has these settings no matter what
+  nano.setTagProtocol(); //Set protocol to GEN2
+
+  nano.setAntennaPort(); //Set TX/RX antenna ports to 1
+
+  return (true); //We are ready to rock
+}
+
+void loop() {
+  gps.runCoroutine();
+  RFIDScan.runCoroutine();
+  QRScan.runCoroutine();
+  readAndSendRecord.runCoroutine();
+}
